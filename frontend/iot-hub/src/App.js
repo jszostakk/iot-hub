@@ -1,23 +1,22 @@
 // src/App.js
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Amplify } from 'aws-amplify';
-
 import {
   signIn,
+  confirmSignIn,
   signOut as signOutAuth,
   getCurrentUser,
   fetchAuthSession,
   resetPassword,
   confirmResetPassword,
-  confirmSignIn,
-} from '@aws-amplify/auth';
-import { get as apiGet, post as apiPost } from '@aws-amplify/api-rest';
+} from 'aws-amplify/auth';
 import awsconfig from './aws-exports';
+import { QRCodeSVG } from 'qrcode.react';
 
 Amplify.configure(awsconfig);
 
-/* ───── optional helper for the AdminResetUserPassword Lambda ───── */
-const API_BASE = process.env.REACT_APP_API_URL;      // put ApiURL from CDK in .env
+// ───────── helper for your Go Lambda ─────────
+const API_BASE = process.env.REACT_APP_API_URL;
 const postJSON = (path, body) =>
   fetch(`${API_BASE}${path}`, {
     method: 'POST',
@@ -29,18 +28,26 @@ const postJSON = (path, body) =>
   });
 
 export default function App() {
-  /* ---------- auth state ---------- */
-  const [email, setEmail]                 = useState('');
-  const [password, setPassword]           = useState('');
+  /* ---------- basic auth state ---------- */
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [isAuthenticated, setIsAuthenticated] = useState(null);
 
-  /* extra states for password challenges / reset */
-  const [tmpPwChallenge, setTmpPwChallenge]     = useState(false);
-  const [inResetFlow,    setInResetFlow]        = useState(false);
-  const [verificationCode, setVerificationCode] = useState('');
-  const [newPassword, setNewPassword]           = useState('');
+  /* NEW-PASSWORD challenge */
+  const [tmpPwChallenge, setTmpPwChallenge] = useState(false);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
 
-  /* ---------- check existing session on mount ---------- */
+  /* RESET-PASSWORD flow */
+  const [inResetFlow, setInResetFlow] = useState(false);
+  const [verificationCode, setVerificationCode] = useState('');
+
+  /* MFA:  null | 'totpSetup' | 'signinTotp' */
+  const [mfaStage, setMfaStage] = useState(null);
+  const [qrUri, setQrUri] = useState('');
+  const [mfaCode, setMfaCode] = useState('');
+
+  /* ---------- check session on mount ---------- */
   useEffect(() => {
     (async () => {
       try {
@@ -55,196 +62,235 @@ export default function App() {
   /* ---------- sign-in ---------- */
   const login = async () => {
     try {
-      const result = await signIn({ username: email, password });
-      const { signInStep } = result.nextStep;
+      const { nextStep } = await signIn({ username: email, password });
 
-      switch (signInStep) {
-        case 'DONE':
-          await fetchAuthSession();
-          setIsAuthenticated(true);
-          alert('✅ Login successful!');
-          break;
-
-        case 'RESET_PASSWORD':                   // admin set RESET_REQUIRED
-          await startResetFlow(email);
-          break;
-
-        case 'CONFIRM_SIGN_IN_WITH_NEW_PASSWORD_REQUIRED':
-          setTmpPwChallenge(true);               // temp password still valid
-          break;
-
-        default:
-          console.warn('[Auth] unhandled step:', signInStep);
-      }
+      handleNextStep(nextStep);
     } catch (err) {
-      /* temp password exists but already EXPIRED */
-      if (
-        err.name === 'NotAuthorizedException' &&
-        /Temporary password has expired/i.test(err.message)
-      ) {
-        await triggerAdminReset(email);          // optional helper below
-        return;
-      }
-      console.error('login error', err);
-      alert('🚫 Login failed: ' + err.message);
+      console.error(err);
+      alert(`Login failed: ${err.message}`);
     }
   };
 
-  /* ---------- optional AdminResetUserPassword fallback ---------- */
-  const triggerAdminReset = async (username) => {
-    try {
-      await postJSON('/reset-expired-password', { username });
-      alert('📧 A reset code has been emailed to you.');
-      await startResetFlow(username);
-    } catch (err) {
-      console.error('[Reset] admin reset failed', err);
-      alert('❌ Automatic reset failed. Contact support.');
+  /* ---------- central next-step handler ---------- */
+  const handleNextStep = (nextStep) => {
+    switch (nextStep.signInStep) {
+      case 'DONE':
+        setIsAuthenticated(true);
+        break;
+
+      case 'RESET_PASSWORD':
+        startResetFlow(email);
+        break;
+
+      case 'CONFIRM_SIGN_IN_WITH_NEW_PASSWORD_REQUIRED':
+        setTmpPwChallenge(true);
+        break;
+
+      case 'CONFIRM_SIGN_IN_WITH_TOTP_CODE':
+        /* user already has MFA configured */
+        setMfaStage('signinTotp');
+        break;
+
+      case 'CONTINUE_SIGN_IN_WITH_TOTP_SETUP':
+        /* first-time TOTP setup */
+        const uri = nextStep.totpSetupDetails.getSetupUri({
+          issuer: 'IoTHub',
+          label: email,
+        });
+        setQrUri(uri);
+        setMfaStage('totpSetup');
+        break;
+
+      default:
+        console.warn('Unhandled nextStep:', nextStep.signInStep);
     }
   };
 
-  /* ---------- NEW_PASSWORD_REQUIRED challenge ---------- */
+  /* ---------- confirm new-password ---------- */
   const submitNewPassword = async () => {
+    if (newPassword !== confirmPassword)
+      return alert('Passwords do not match');
+
     try {
-      await confirmSignIn({ challengeResponse: newPassword });
-      await fetchAuthSession();
+      const { nextStep } = await confirmSignIn({
+        challengeResponse: newPassword,
+      });
       setTmpPwChallenge(false);
-      setIsAuthenticated(true);
-      alert('✅ Password set and login complete!');
+      handleNextStep(nextStep);
     } catch (err) {
-      console.error('[Auth] confirmSignIn error', err);
-      alert('❌ Could not set new password: ' + err.message);
+      alert(`Could not set new password: ${err.message}`);
     }
   };
 
-  /* ---------- self-service reset ---------- */
+  /* ---------- confirm TOTP (either setup or sign-in) ---------- */
+  const submitTotpCode = async () => {
+    try {
+      const { nextStep } = await confirmSignIn({
+        challengeResponse: mfaCode,
+      });
+      setMfaCode('');
+      handleNextStep(nextStep); // will be DONE when correct
+    } catch (err) {
+      alert(`Invalid code: ${err.message}`);
+    }
+  };
+
+  /* ---------- password-reset helpers ---------- */
   const startResetFlow = async (username) => {
-    if (!username) return alert('Enter your email first.');
+    if (!username) return alert('Enter email first');
     try {
       await resetPassword({ username });
       setInResetFlow(true);
-      alert('📧 Verification code sent to your email.');
     } catch (err) {
-      /* user still FORCE_CHANGE_PASSWORD but temp-pw not expired */
-      if (
-        err.name === 'NotAuthorizedException' &&
-        /current state/i.test(err.message)
-      ) {
-        await triggerAdminReset(username);       // fallback
-        return;
-      }
-      console.error('[Auth] resetPassword error', err);
-      alert('❌ Reset failed: ' + err.message);
+      alert(`Reset failed: ${err.message}`);
     }
   };
 
   const confirmReset = async () => {
+    if (newPassword !== confirmPassword)
+      return alert('Passwords do not match');
+
     try {
       await confirmResetPassword({
         username: email,
         confirmationCode: verificationCode,
         newPassword,
       });
-      alert('✅ Password reset. Sign in with the new password.');
+      alert('Password reset – sign in with the new password.');
       setInResetFlow(false);
       setPassword('');
     } catch (err) {
-      console.error('[Auth] confirmResetPassword error', err);
-      alert('❌ Confirmation failed: ' + err.message);
+      alert(`Confirmation failed: ${err.message}`);
     }
   };
+
+  /* ---------- IoT helpers ---------- */
+  const callONLed = () =>
+    postJSON('/set-led', { topic: 'button/press', message: 'ON' });
+  const callOFFLed = () =>
+    postJSON('/set-led', { topic: 'button/press', message: 'OFF' });
 
   /* ---------- sign-out ---------- */
   const logout = async () => {
-    try {
-      await signOutAuth();
-      setIsAuthenticated(false);
-    } catch (err) {
-      console.error('logout error', err);
-    }
+    await signOutAuth();
+    setIsAuthenticated(false);
   };
-
-  /* ---------- IoT API helpers ---------- */
-  const callONLed = async () => {
-    try {
-      const res = await postJSON('/set-led', {
-        topic: 'button/press',
-        message: 'ON'
-      });
-      console.log('LED ON →', res);
-    } catch (err) {
-      console.error('LED ON error →', err);
-    }
-  };
-  
-  const callOFFLed = async () => {
-    try {
-      const res = await postJSON('/set-led', {
-        topic: 'button/press',
-        message: 'OFF'
-      });
-      console.log('LED OFF →', res);
-    } catch (err) {
-      console.error('LED OFF error →', err);
-    }
-  };   
 
   /* ---------- UI ---------- */
-  if (isAuthenticated === null) return <div>Loading...</div>;
+  if (isAuthenticated === null) return <div>Loading…</div>;
 
   return (
     <div style={{ padding: 20 }}>
       <h1>IoT Hub Frontend</h1>
 
       {isAuthenticated ? (
+        /* ───── signed-in screen ───── */
         <>
-          <p>👋 You’re signed in</p>
+          <p>👋 Signed in</p>
           <button onClick={logout}>Sign Out</button>
           <hr />
-          <button onClick={callONLed}>Turn LED ON</button>{' '}
-          <button onClick={callOFFLed}>Turn LED OFF</button>
+          <button onClick={callONLed}>LED ON</button>{' '}
+          <button onClick={callOFFLed}>LED OFF</button>
         </>
       ) : tmpPwChallenge ? (
+        /* ───── new-password screen ───── */
         <>
-          <h2>Set a New Password</h2>
+          <h2>Set New Password</h2>
           <input
             type="password"
-            placeholder="New Password"
+            placeholder="New password"
             value={newPassword}
             onChange={(e) => setNewPassword(e.target.value)}
-          /><br /><br />
+          />
+          <br />
+          <br />
+          <input
+            type="password"
+            placeholder="Confirm password"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+          />
+          <br />
+          <br />
           <button onClick={submitNewPassword}>Submit</button>
         </>
       ) : inResetFlow ? (
+        /* ───── reset-password screen ───── */
         <>
           <h2>Reset Password</h2>
           <input
-            type="text"
-            placeholder="Verification Code"
+            placeholder="Verification code"
             value={verificationCode}
             onChange={(e) => setVerificationCode(e.target.value)}
-          /><br /><br />
+          />
+          <br />
+          <br />
           <input
             type="password"
-            placeholder="New Password"
+            placeholder="New password"
             value={newPassword}
             onChange={(e) => setNewPassword(e.target.value)}
-          /><br /><br />
-          <button onClick={confirmReset}>Submit New Password</button>
+          />
+          <br />
+          <br />
+          <input
+            type="password"
+            placeholder="Confirm password"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+          />
+          <br />
+          <br />
+          <button onClick={confirmReset}>Confirm</button>
+        </>
+      ) : mfaStage === 'totpSetup' ? (
+        /* ───── first-time TOTP setup ───── */
+        <>
+          <h2>Enable TOTP MFA</h2>
+          <QRCodeSVG value={qrUri} />
+          <br />
+          <br />
+          <input
+            placeholder="6-digit code"
+            value={mfaCode}
+            onChange={(e) => setMfaCode(e.target.value)}
+          />
+          <br />
+          <br />
+          <button onClick={submitTotpCode}>Verify</button>
+        </>
+      ) : mfaStage === 'signinTotp' ? (
+        /* ───── regular TOTP challenge ───── */
+        <>
+          <h2>Enter TOTP Code</h2>
+          <input
+            placeholder="6-digit code"
+            value={mfaCode}
+            onChange={(e) => setMfaCode(e.target.value)}
+          />
+          <br />
+          <br />
+          <button onClick={submitTotpCode}>Verify</button>
         </>
       ) : (
+        /* ───── sign-in form ───── */
         <>
           <input
             type="email"
             placeholder="Email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-          /><br /><br />
+          />
+          <br />
+          <br />
           <input
             type="password"
             placeholder="Password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-          /><br /><br />
+          />
+          <br />
+          <br />
           <button onClick={login}>Login</button>{' '}
           <button onClick={() => startResetFlow(email)}>Forgot Password</button>
         </>

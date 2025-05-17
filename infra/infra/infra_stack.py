@@ -146,8 +146,14 @@ class InfraStack(Stack):
             sign_in_aliases=cognito.SignInAliases(email=True),
             auto_verify=cognito.AutoVerifiedAttrs(email=True),
             account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
+            mfa=cognito.Mfa.REQUIRED,
+            mfa_second_factor=cognito.MfaSecondFactor(
+                sms=False,
+                otp=True
+            ),
             removal_policy=RemovalPolicy.DESTROY
         )
+
 
         user_pool_client = user_pool.add_client("IoTHubAppClient",
             auth_flows=cognito.AuthFlow(
