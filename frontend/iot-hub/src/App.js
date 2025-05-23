@@ -2,11 +2,12 @@
 import React, { useEffect, useState } from 'react';
 import { Amplify } from 'aws-amplify';
 import {
+  /* ---------- auth helpers ---------- */
   signIn,
   confirmSignIn,
   signOut as signOutAuth,
   getCurrentUser,
-  fetchAuthSession,
+  fetchAuthSession,     // ★ used to obtain the Cognito JWT
   resetPassword,
   confirmResetPassword,
 } from 'aws-amplify/auth';
@@ -15,17 +16,31 @@ import { QRCodeSVG } from 'qrcode.react';
 
 Amplify.configure(awsconfig);
 
-// ───────── helper for your Go Lambda ─────────
+// ---------- helper to fetch the Cognito ID-token (JWT) ---------- ★
+async function getIdToken() {
+  const { tokens } = await fetchAuthSession();   // v6 helper
+  return tokens?.idToken?.toString() ?? null;    // null if not signed-in
+}
+
+// ---------- generic POST helper that attaches the JWT ---------- ★
 const API_BASE = process.env.REACT_APP_API_URL;
-const postJSON = (path, body) =>
-  fetch(`${API_BASE}${path}`, {
+console.log(`API_BASE: ${API_BASE}`);
+async function postJSON(path, body) {
+  const idToken = await getIdToken();            // may be null if session expired
+  if (!idToken) throw new Error('Not authenticated');
+
+  const r = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${idToken}`,        // send JWT to API Gateway
+    },
     body: JSON.stringify(body),
-  }).then((r) => {
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
   });
+
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
 
 export default function App() {
   /* ---------- basic auth state ---------- */
@@ -63,7 +78,6 @@ export default function App() {
   const login = async () => {
     try {
       const { nextStep } = await signIn({ username: email, password });
-
       handleNextStep(nextStep);
     } catch (err) {
       console.error(err);
@@ -77,22 +91,16 @@ export default function App() {
       case 'DONE':
         setIsAuthenticated(true);
         break;
-
       case 'RESET_PASSWORD':
         startResetFlow(email);
         break;
-
       case 'CONFIRM_SIGN_IN_WITH_NEW_PASSWORD_REQUIRED':
         setTmpPwChallenge(true);
         break;
-
       case 'CONFIRM_SIGN_IN_WITH_TOTP_CODE':
-        /* user already has MFA configured */
         setMfaStage('signinTotp');
         break;
-
       case 'CONTINUE_SIGN_IN_WITH_TOTP_SETUP':
-        /* first-time TOTP setup */
         const uri = nextStep.totpSetupDetails.getSetupUri({
           issuer: 'IoTHub',
           label: email,
@@ -100,7 +108,6 @@ export default function App() {
         setQrUri(uri);
         setMfaStage('totpSetup');
         break;
-
       default:
         console.warn('Unhandled nextStep:', nextStep.signInStep);
     }
@@ -108,9 +115,7 @@ export default function App() {
 
   /* ---------- confirm new-password ---------- */
   const submitNewPassword = async () => {
-    if (newPassword !== confirmPassword)
-      return alert('Passwords do not match');
-
+    if (newPassword !== confirmPassword) return alert('Passwords do not match');
     try {
       const { nextStep } = await confirmSignIn({
         challengeResponse: newPassword,
@@ -129,7 +134,7 @@ export default function App() {
         challengeResponse: mfaCode,
       });
       setMfaCode('');
-      handleNextStep(nextStep); // will be DONE when correct
+      handleNextStep(nextStep);
     } catch (err) {
       alert(`Invalid code: ${err.message}`);
     }
@@ -147,9 +152,7 @@ export default function App() {
   };
 
   const confirmReset = async () => {
-    if (newPassword !== confirmPassword)
-      return alert('Passwords do not match');
-
+    if (newPassword !== confirmPassword) return alert('Passwords do not match');
     try {
       await confirmResetPassword({
         username: email,
@@ -164,11 +167,23 @@ export default function App() {
     }
   };
 
-  /* ---------- IoT helpers ---------- */
-  const callONLed = () =>
-    postJSON('/set-led', { topic: 'button/press', message: 'ON' });
-  const callOFFLed = () =>
-    postJSON('/set-led', { topic: 'button/press', message: 'OFF' });
+  /* ---------- IoT helpers (secured) ---------- */          // ★
+  const callONLed = async () => {
+    try {
+      await postJSON('/set-led', { topic: 'button/press', message: 'ON' });
+      alert('LED ON message sent');
+    } catch (err) {
+      alert(`Error: ${err.message}`);
+    }
+  };
+  const callOFFLed = async () => {
+    try {
+      await postJSON('/set-led', { topic: 'button/press', message: 'OFF' });
+      alert('LED OFF message sent');
+    } catch (err) {
+      alert(`Error: ${err.message}`);
+    }
+  };
 
   /* ---------- sign-out ---------- */
   const logout = async () => {
