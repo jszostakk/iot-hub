@@ -11,6 +11,8 @@ from aws_cdk import (
     aws_s3_deployment as s3deploy,
     aws_iam as iam,
     aws_ssm as ssm,
+    aws_iot as iot,
+    aws_ssm as ssm,
     CfnOutput,
 )
 from constructs import Construct
@@ -179,6 +181,44 @@ class InfraStack(Stack):
             authorizer=authorizer,
             authorization_type=apigateway.AuthorizationType.COGNITO,
         )
+
+        thing = iot.CfnThing(self, "EspThing", thing_name="esp8266-001")
+
+        iot_policy = iot.CfnPolicy(
+            self, "EspPolicy",
+            policy_name="EspPolicy",
+            policy_document={
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                    "Effect": "Allow",
+                    "Action": "iot:Connect",
+                    "Resource":
+                    f"arn:aws:iot:{self.region}:{self.account}:client/${{iot:Connection.Thing.ThingName}}"
+                    },
+                    {  # subscribe & receive commands
+                    "Effect": "Allow",
+                    "Action": ["iot:Subscribe", "iot:Receive"],
+                    "Resource":
+                    f"arn:aws:iot:{self.region}:{self.account}:topicfilter/esp8266/commands/#"
+                    }
+                ]
+            }
+        )
+        
+        cert_arn = "arn:aws:iot:eu-central-1:362554412840:cert/a6a16362059843b24e67a99ec569ef8301005a7dcad0794376cb4561c53f72de"
+
+        iot.CfnPolicyPrincipalAttachment(
+            self, "AttachPol",
+            policy_name=iot_policy.ref,
+            principal=cert_arn
+        )
+
+        iot.CfnThingPrincipalAttachment(
+            self, "AttachThing",
+            thing_name=thing.ref,
+            principal=cert_arn
+        )             
 
         # ───────────── Outputs ─────────────
         CfnOutput(self, "CloudFrontURL", value=f"https://{distribution.attr_domain_name}")
